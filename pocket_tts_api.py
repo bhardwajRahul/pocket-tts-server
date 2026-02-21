@@ -442,7 +442,7 @@ async def list_voices():
 
 
 def call_llm(messages: List[Dict[str, str]], stream: bool = False) -> Dict[str, Any]:
-    """Call external LLM API"""
+    """Call external LLM API (non-streaming)"""
     llm_config = config.get("llm", {})
 
     if not llm_config.get("enabled", False):
@@ -490,7 +490,7 @@ def call_llm(messages: List[Dict[str, str]], stream: bool = False) -> Dict[str, 
         payload = {
             "model": model,
             "messages": full_messages,
-            "stream": stream,
+            "stream": False,  # Always non-streaming for this function
             "max_tokens": 4000,
             "temperature": 0.7,
         }
@@ -545,6 +545,86 @@ def call_llm(messages: List[Dict[str, str]], stream: bool = False) -> Dict[str, 
         }
 
 
+async def stream_llm_tokens(messages: List[Dict[str, str]]):
+    """
+    Stream tokens from LLM in real-time.
+    Yields individual tokens/chunks as they arrive from the LLM.
+    """
+    llm_config = config.get("llm", {})
+
+    if not llm_config.get("enabled", False):
+        # Fallback: echo mode - yield entire message at once
+        last_message = None
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_message = msg.get("content", "")
+                break
+
+        content = f"Echo: {last_message}" if last_message else "No message received."
+        for word in content.split():
+            yield word + " "
+        return
+
+    try:
+        api_url = llm_config.get("api_url", "http://localhost:8080/v1/chat/completions")
+        api_key = llm_config.get("api_key", "")
+        model = llm_config.get("model", "llama-3")
+        system_prompt = llm_config.get(
+            "system_prompt", "You are a helpful AI assistant."
+        )
+
+        # Prepare messages with system prompt
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": model,
+            "messages": full_messages,
+            "stream": True,  # Enable streaming
+            "max_tokens": 4000,
+            "temperature": 0.7,
+        }
+
+        print(f"[INFO] Starting LLM stream at {api_url}")
+
+        # Use stream=True to get response as it comes
+        response = requests.post(
+            api_url, json=payload, headers=headers, stream=True, timeout=180
+        )
+        response.raise_for_status()
+
+        # Process SSE stream from LLM
+        for line in response.iter_lines():
+            if line:
+                line = line.decode("utf-8")
+                # SSE format: "data: {...}"
+                if line.startswith("data: "):
+                    data = line[6:]  # Remove "data: " prefix
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(data)
+                        # Extract token content from OpenAI-compatible format
+                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                    except json.JSONDecodeError:
+                        continue
+
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] Cannot connect to LLM at {api_url}")
+        yield "Error: Cannot connect to LLM server. Please check your llama.cpp server is running."
+    except Exception as e:
+        print(f"[ERROR] LLM stream failed: {e}")
+        yield f"Error calling LLM: {str(e)}"
+
+
 # ============== Voice Chat Endpoints ==============
 
 
@@ -591,103 +671,99 @@ def generate_sentence_audio_sync(voice_state, sentence):
 
 async def stream_chat_response(request: VoiceChatRequest):
     """
-    Generator for streaming chat completions with real-time text AND chunked audio streaming.
-    This generates audio sentence-by-sentence for faster first-audio delivery.
+    Generator for TRUE streaming chat completions with real-time text AND audio streaming.
+    Streams text tokens immediately, generates and streams audio AS SOON as each sentence completes.
     """
     try:
-        print(f"[INFO] Starting stream_chat_response with voice: {request.voice}")
+        print(f"[INFO] Starting TRUE stream_chat_response with voice: {request.voice}")
 
-        # Call LLM WITHOUT streaming - we'll handle streaming ourselves
-        llm_response = call_llm(request.messages, stream=False)
-
-        # Extract response text
-        if "choices" in llm_response and len(llm_response["choices"]) > 0:
-            response_text = llm_response["choices"][0]["message"]["content"]
-        else:
-            response_text = "Sorry, I couldn't generate a response."
-
-        print(f"[INFO] LLM response received: {len(response_text)} chars")
-
-        # Get voice state (load once for entire response)
+        # Get voice state (load once at start)
         voice_state = None
         if tts_model:
-            print(
-                f"[INFO] TTS model available, getting voice state for: {request.voice}"
-            )
+            print(f"[INFO] Getting voice state for: {request.voice}")
             if request.voice in voice_states:
                 voice_state = voice_states[request.voice]
-                print(f"[INFO] Using cached voice state")
             elif request.voice in available_voices:
                 voice_file = available_voices[request.voice]["file"]
-                print(f"[INFO] Loading voice state from file: {voice_file}")
                 try:
                     voice_state = tts_model.get_state_for_audio_prompt(voice_file)
                     voice_states[request.voice] = voice_state
-                    print(f"[INFO] Voice state loaded successfully")
+                    print(f"[INFO] Voice state loaded")
                 except Exception as e:
                     print(f"[WARNING] Failed to load voice state: {e}")
-                    import traceback
 
-                    traceback.print_exc()
-            else:
-                print(f"[WARNING] Voice not found: {request.voice}")
-                print(f"[INFO] Available voices: {list(available_voices.keys())}")
-        else:
-            print(f"[WARNING] TTS model not available")
+        # Buffers
+        sentence_buffer = ""
+        sentence_idx = 0
+        accumulated_text = ""
+        pending_audio_tasks = []  # (idx, sentence, task)
 
-        # Split text into sentences for chunked generation
-        sentences = split_into_sentences(response_text)
-        print(f"[INFO] Split into {len(sentences)} sentences")
-        print(f"[INFO] Total text length: {len(response_text)} chars")
+        print(f"[INFO] Starting LLM stream...")
 
-        # Process each sentence - stream text then audio for each sentence
-        for sentence_idx, sentence in enumerate(sentences):
-            sentence_words = sentence.split()
-            print(
-                f"[INFO] Processing sentence {sentence_idx}: '{sentence[:50]}...' ({len(sentence_words)} words)"
-            )
+        # Stream tokens from LLM as they arrive
+        async for token in stream_llm_tokens(request.messages):
+            # Stream text to client IMMEDIATELY
+            yield f"data: {json.dumps({'type': 'text', 'content': token})}\n\n"
 
-            # Stream this sentence's text word by word
-            for word in sentence_words:
-                # Add space after each word except the last
-                content = word + " "
-                yield f"data: {json.dumps({'type': 'text', 'content': content})}\n\n"
+            # Accumulate
+            sentence_buffer += token
+            accumulated_text += token
 
-            # Small delay to let text render before audio starts
-            await asyncio.sleep(0.05)
+            # Check for sentence end
+            sentence_end_chars = [".", "!", "?", "。", "！", "？", "\n"]
+            has_sentence_end = any(char in token for char in sentence_end_chars)
 
-            # Generate and stream audio for this sentence immediately after its text
-            if voice_state and sentence.strip():
-                print(f"[INFO] Generating audio for sentence {sentence_idx}")
-                try:
-                    # Run TTS generation in thread pool to not block
-                    loop = asyncio.get_event_loop()
-                    audio_data = await loop.run_in_executor(
-                        None, generate_sentence_audio_sync, voice_state, sentence
-                    )
+            # Process complete sentences immediately
+            if has_sentence_end and sentence_buffer.strip() and voice_state:
+                sentences = split_into_sentences(sentence_buffer)
 
-                    if audio_data:
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if len(sentence) > 5:  # Valid sentence
                         print(
-                            f"[INFO] Audio generated for sentence {sentence_idx}: {len(audio_data)} bytes"
+                            f"[INFO] Sentence {sentence_idx} complete: '{sentence[:40]}...'"
                         )
-                        yield f"data: {json.dumps({'type': 'audio', 'data': audio_data, 'format': 'wav', 'chunk': sentence_idx})}\n\n"
-                        print(f"[INFO] Audio data sent for sentence {sentence_idx}")
-                    else:
-                        print(
-                            f"[WARNING] No audio data generated for sentence {sentence_idx}"
-                        )
-                except Exception as e:
-                    print(
-                        f"[ERROR] TTS generation failed for sentence {sentence_idx}: {e}"
-                    )
-                    import traceback
 
-                    traceback.print_exc()
-            else:
-                if not voice_state:
-                    print(f"[WARNING] No voice state available for TTS")
-                if not sentence.strip():
-                    print(f"[WARNING] Empty sentence, skipping audio")
+                        # Generate TTS NOW (blocking is OK here - we want audio ASAP)
+                        try:
+                            loop = asyncio.get_event_loop()
+                            audio_data = await loop.run_in_executor(
+                                None,
+                                generate_sentence_audio_sync,
+                                voice_state,
+                                sentence,
+                            )
+
+                            if audio_data:
+                                print(
+                                    f"[INFO] Streaming audio for sentence {sentence_idx}"
+                                )
+                                yield f"data: {json.dumps({'type': 'audio', 'data': audio_data, 'format': 'wav', 'chunk': sentence_idx})}\n\n"
+
+                            sentence_idx += 1
+                        except Exception as e:
+                            print(f"[ERROR] TTS failed: {e}")
+
+                # Clear processed sentences
+                sentence_buffer = ""
+
+        print(f"[INFO] LLM complete: {len(accumulated_text)} chars")
+
+        # Process any remaining text
+        if sentence_buffer.strip() and voice_state and len(sentence_buffer) > 3:
+            print(f"[INFO] Final sentence: '{sentence_buffer[:40]}...'")
+            try:
+                loop = asyncio.get_event_loop()
+                audio_data = await loop.run_in_executor(
+                    None,
+                    generate_sentence_audio_sync,
+                    voice_state,
+                    sentence_buffer.strip(),
+                )
+                if audio_data:
+                    yield f"data: {json.dumps({'type': 'audio', 'data': audio_data, 'format': 'wav', 'chunk': sentence_idx})}\n\n"
+            except Exception as e:
+                print(f"[ERROR] Final TTS failed: {e}")
 
         print(f"[INFO] Streaming complete, sending done signal")
         yield f"data: {json.dumps({'type': 'done'})}\n\n"

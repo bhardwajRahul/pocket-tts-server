@@ -313,7 +313,7 @@ MIT License - Free for personal and commercial use.
 
 ## 🙏 Credits
 
-- [pocket-tts](https://github.com/metavoiceio/pocket-tts) - The TTS engine
+- [pocket-tts](https://github.com/kyutai-labs/pocket-tts) - The TTS engine
 - [FastAPI](https://fastapi.tiangolo.com/) - Web framework
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) - Recommended LLM backend
 

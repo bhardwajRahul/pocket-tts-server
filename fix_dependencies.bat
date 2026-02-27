@@ -20,7 +20,7 @@ python -m pip install --upgrade pip setuptools wheel
 
 echo.
 echo [3/4] Reinstalling critical packages...
-pip install --force-reinstall pocket-tts soundfile scipy numpy
+pip install --force-reinstall pocket-tts soundfile scipy numpy pydub
 
 echo.
 echo [4/4] Verifying installation...
